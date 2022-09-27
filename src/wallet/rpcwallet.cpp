@@ -2576,53 +2576,66 @@ static UniValue walletpassphrase(const JSONRPCRequest& request)
         );
     }
 
-    LOCK2(cs_main, pwallet->cs_wallet);
-
-    if (!pwallet->IsCrypted()) {
-        throw JSONRPCError(RPC_WALLET_WRONG_ENC_STATE, "Error: running with an unencrypted wallet, but walletpassphrase was called.");
-    }
-
-    // Note that the walletpassphrase is stored in request.params[0] which is not mlock()ed
-    SecureString strWalletPass;
-    strWalletPass.reserve(100);
-    // TODO: get rid of this .c_str() by implementing SecureString::operator=(std::string)
-    // Alternately, find a way to make request.params[0] mlock()'d to begin with.
-    strWalletPass = request.params[0].get_str().c_str();
-
     // Get the timeout
     int64_t nSleepTime = request.params[1].get_int64();
-    // Timeout cannot be negative, otherwise it will relock immediately
-    if (nSleepTime < 0) {
-        throw JSONRPCError(RPC_INVALID_PARAMETER, "Timeout cannot be negative.");
-    }
-    // Clamp timeout
-    constexpr int64_t MAX_SLEEP_TIME = 100000000; // larger values trigger a macos/libevent bug?
-    if (nSleepTime > MAX_SLEEP_TIME) {
-        nSleepTime = MAX_SLEEP_TIME;
-    }
-
-    if (strWalletPass.length() > 0)
+	int64_t relock_time;
+	
+	// Prevent concurrent calls to walletpassphrase with the same wallet.
+    LOCK(pwallet->m_unlock_mutex);
     {
-        if (!pwallet->Unlock(strWalletPass)) {
-            throw JSONRPCError(RPC_WALLET_PASSPHRASE_INCORRECT, "Error: The wallet passphrase entered was incorrect.");
-        }
-    }
-    else
-        throw std::runtime_error(
-            "walletpassphrase <passphrase> <timeout>\n"
-            "Stores the wallet decryption key in memory for <timeout> seconds.");
+		
+		LOCK2(cs_main, pwallet->cs_wallet);
 
-    pwallet->TopUpKeyPool();
+		if (!pwallet->IsCrypted()) {
+		throw JSONRPCError(RPC_WALLET_WRONG_ENC_STATE, "Error: running with an unencrypted wallet, but walletpassphrase was called.");
+		}
 
-    pwallet->nRelockTime = GetTime() + nSleepTime;
+		// Note that the walletpassphrase is stored in request.params[0] which is not mlock()ed
+		SecureString strWalletPass;
+		strWalletPass.reserve(100);
+		// TODO: get rid of this .c_str() by implementing SecureString::operator=(std::string)
+		// Alternately, find a way to make request.params[0] mlock()'d to begin with.
+		strWalletPass = request.params[0].get_str().c_str();
+
+		// Timeout cannot be negative, otherwise it will relock immediately
+		if (nSleepTime < 0) {
+			throw JSONRPCError(RPC_INVALID_PARAMETER, "Timeout cannot be negative.");
+		}
+		// Clamp timeout
+		constexpr int64_t MAX_SLEEP_TIME = 100000000; // larger values trigger a macos/libevent bug?
+		if (nSleepTime > MAX_SLEEP_TIME) {
+			nSleepTime = MAX_SLEEP_TIME;
+		}
+
+		if (strWalletPass.length() > 0)
+		{
+			if (!pwallet->Unlock(strWalletPass)) {
+				throw JSONRPCError(RPC_WALLET_PASSPHRASE_INCORRECT, "Error: The wallet passphrase entered was incorrect.");
+			}
+		}
+		else
+			throw std::runtime_error(
+				"walletpassphrase <passphrase> <timeout>\n"
+				"Stores the wallet decryption key in memory for <timeout> seconds.");
+
+		pwallet->TopUpKeyPool();
+
+		pwallet->nRelockTime = GetTime() + nSleepTime;
+		relock_time = pwallet->nRelockTime;
+	
+	}
 
     // Keep a weak pointer to the wallet so that it is possible to unload the
     // wallet before the following callback is called. If a valid shared pointer
     // is acquired in the callback then the wallet is still loaded.
     std::weak_ptr<CWallet> weak_wallet = wallet;
-    RPCRunLater(strprintf("lockwallet(%s)", pwallet->GetName()), [weak_wallet] {
+    RPCRunLater(strprintf("lockwallet(%s)", pwallet->GetName()), [weak_wallet, relock_time] {
         if (auto shared_wallet = weak_wallet.lock()) {
             LOCK(shared_wallet->cs_wallet);
+			// Skip if this is not the most recent rpcRunLater callback.
+            if (shared_wallet->nRelockTime != relock_time) {
+			    return;
+            }
             shared_wallet->Lock();
             shared_wallet->nRelockTime = 0;
         }
